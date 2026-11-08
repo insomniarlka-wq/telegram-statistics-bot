@@ -1,14 +1,14 @@
 
 import os
-import re
 import json
 import sqlite3
 import logging
 import asyncio
 import tempfile
+import time
 
 from pathlib import Path
-from contextlib import closing
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 from telegram import Update
@@ -32,7 +32,6 @@ DB_PATH = os.getenv("DB_PATH", "bot_database.db")
 GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
     "GOOGLE_SERVICE_ACCOUNT_JSON"
 )
-
 GOOGLE_DRIVE_FOLDER_ID = os.getenv(
     "GOOGLE_DRIVE_FOLDER_ID"
 )
@@ -46,14 +45,29 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+REWARD_LEVELS = [
+    (100, "Активист"),
+    (500, "Постоянный участник"),
+    (1000, "Легенда чата"),
+    (5000, "Мастер общения"),
+]
+
 
 # =============== БАЗА ДАННЫХ ===============
 
+@contextmanager
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA busy_timeout = 30000")
-    return closing(conn)
+
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -82,7 +96,21 @@ def init_db():
             )
         """)
 
-        # Миграция старых баз данных
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS activity (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                chat_id INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_activity_user_chat_time
+            ON activity(user_id, chat_id, timestamp)
+        """)
+
+        # Совместимость со старой базой
         columns = {
             row["name"]
             for row in conn.execute(
@@ -106,7 +134,7 @@ def init_db():
                     f"{column} {definition}"
                 )
 
-        conn.commit()
+    logger.info("База данных готова.")
 
 
 # =============== ПОЛЬЗОВАТЕЛИ ===============
@@ -117,13 +145,8 @@ def save_user(user):
     with db() as conn:
         conn.execute("""
             INSERT INTO users (
-                user_id,
-                username,
-                first_name,
-                nickname,
-                messages,
-                joined,
-                last_seen
+                user_id, username, first_name,
+                nickname, messages, joined, last_seen
             )
             VALUES (?, ?, ?, '', 0, ?, ?)
 
@@ -139,15 +162,13 @@ def save_user(user):
             now,
         ))
 
-        conn.commit()
-
 
 def get_user(user_id):
     with db() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE user_id = ?",
-            (user_id,),
-        ).fetchone()
+        return conn.execute("""
+            SELECT * FROM users
+            WHERE user_id = ?
+        """, (user_id,)).fetchone()
 
 
 def get_user_by_username(username):
@@ -157,7 +178,6 @@ def get_user_by_username(username):
         return conn.execute("""
             SELECT * FROM users
             WHERE LOWER(username) = ?
-            LIMIT 1
         """, (username,)).fetchone()
 
 
@@ -173,6 +193,8 @@ def get_display_name(user):
     return user["first_name"] or "Пользователь"
 
 
+# =============== НИК ===============
+
 def set_nickname(user_id, nickname):
     with db() as conn:
         cursor = conn.execute("""
@@ -181,39 +203,158 @@ def set_nickname(user_id, nickname):
             WHERE user_id = ?
         """, (nickname, user_id))
 
-        conn.commit()
         return cursor.rowcount > 0
 
 
-def count_message(user):
+async def nickname_command(update, context):
+    message = update.message
+    user = update.effective_user
+
+    if not message or not user:
+        return
+
+    nickname = " ".join(context.args).strip()
+
+    if not nickname:
+        await message.reply_text(
+            "✏️ Использование:\n"
+            "+ник НовыйНик\n\n"
+            "Для удаления ника:\n"
+            "+ник сброс"
+        )
+        return
+
+    if len(nickname) > 32:
+        await message.reply_text(
+            "❌ Максимальная длина ника — 32 символа."
+        )
+        return
+
+    if any(ord(char) < 32 for char in nickname):
+        await message.reply_text(
+            "❌ Недопустимые символы."
+        )
+        return
+
+    save_user(user)
+
+    if nickname.lower() == "сброс":
+        set_nickname(user.id, "")
+
+        await message.reply_text(
+            "✅ Твой ник сброшен."
+        )
+        return
+
+    set_nickname(user.id, nickname)
+
+    await message.reply_text(
+        f"✅ Твой новый ник: {nickname}"
+    )
+
+
+# =============== АКТИВНОСТЬ ===============
+
+def count_message(user, chat_id):
+    now = int(time.time())
+
     save_user(user)
 
     with db() as conn:
         conn.execute("""
             UPDATE users
-            SET messages = messages + 1
+            SET messages = messages + 1,
+                last_seen = ?
             WHERE user_id = ?
-        """, (user.id,))
+        """, (
+            datetime.now(timezone.utc).isoformat(),
+            user.id,
+        ))
 
-        conn.commit()
+        conn.execute("""
+            INSERT INTO activity (
+                user_id, chat_id, timestamp
+            )
+            VALUES (?, ?, ?)
+        """, (
+            user.id,
+            chat_id,
+            now,
+        ))
 
-        result = conn.execute("""
+        messages = conn.execute("""
             SELECT messages FROM users
             WHERE user_id = ?
-        """, (user.id,)).fetchone()
+        """, (user.id,)).fetchone()["messages"]
 
-        return result["messages"]
+    return messages
+
+
+def get_activity(user_id, chat_id):
+    now = int(time.time())
+
+    day = now - 86400
+    week = now - 7 * 86400
+    month = now - 30 * 86400
+
+    with db() as conn:
+        result = conn.execute("""
+            SELECT
+                SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS day,
+                SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS week,
+                SUM(CASE WHEN timestamp >= ? THEN 1 ELSE 0 END) AS month,
+                COUNT(*) AS total
+            FROM activity
+            WHERE user_id = ? AND chat_id = ?
+        """, (
+            day,
+            week,
+            month,
+            user_id,
+            chat_id,
+        )).fetchone()
+
+    return (
+        result["day"] or 0,
+        result["week"] or 0,
+        result["month"] or 0,
+        result["total"] or 0,
+    )
+
+
+def format_last_active(last_seen):
+    if not last_seen:
+        return "неизвестно"
+
+    try:
+        last = datetime.fromisoformat(last_seen)
+        if last.tzinfo is None:
+            last = last.replace(tzinfo=timezone.utc)
+
+        seconds = max(
+            0,
+            int((datetime.now(timezone.utc) - last).total_seconds())
+        )
+
+    except (ValueError, TypeError):
+        return "неизвестно"
+
+    if seconds < 60:
+        return "менее минуты назад"
+
+    if seconds < 3600:
+        return f"{seconds // 60} мин. назад"
+
+    if seconds < 86400:
+        return f"{seconds // 3600} ч. назад"
+
+    if seconds < 172800:
+        return "вчера"
+
+    return f"{seconds // 86400} дн. назад"
 
 
 # =============== НАГРАДЫ ===============
-
-REWARD_LEVELS = [
-    (100, "Активист"),
-    (500, "Постоянный участник"),
-    (1000, "Легенда чата"),
-    (5000, "Мастер общения"),
-]
-
 
 def update_rewards(user_id, messages):
     new_rewards = []
@@ -235,8 +376,6 @@ def update_rewards(user_id, messages):
 
                     new_rewards.append(reward)
 
-        conn.commit()
-
     return new_rewards
 
 
@@ -250,6 +389,34 @@ def get_rewards(user_id):
     return [row["reward"] for row in rows]
 
 
+# =============== ПРОВЕРКА ЧАТА ===============
+
+async def get_membership(context, chat_id, user_id):
+    try:
+        member = await context.bot.get_chat_member(
+            chat_id,
+            user_id,
+        )
+
+        if member.status in ("creator", "administrator", "member"):
+            return "💚 Состоит в чате"
+
+        if member.status == "restricted" and member.is_member:
+            return "💚 Состоит в чате"
+
+        if member.status in ("left", "kicked"):
+            return "❤️ Не состоит в чате"
+
+        return "Статус неизвестен"
+
+    except Exception as error:
+        logger.warning(
+            "Не удалось проверить участие: %s",
+            error,
+        )
+        return "Статус неизвестен"
+
+
 # =============== ПРОФИЛЬ ===============
 
 async def profile(update, context):
@@ -258,8 +425,10 @@ async def profile(update, context):
     if not message:
         return
 
+    chat = update.effective_chat
     target = None
 
+    # Профиль по @username или ID
     if context.args:
         argument = context.args[0]
 
@@ -269,102 +438,82 @@ async def profile(update, context):
         elif argument.isdigit():
             target = get_user(int(argument))
 
+    # Профиль через ответ на сообщение
     elif message.reply_to_message:
         replied_user = message.reply_to_message.from_user
 
-        if not replied_user.is_bot:
+        if replied_user and not replied_user.is_bot:
             save_user(replied_user)
             target = get_user(replied_user.id)
 
+    # Свой профиль
     else:
-        current_user = update.effective_user
+        user = update.effective_user
 
-        if current_user:
-            save_user(current_user)
-            target = get_user(current_user.id)
+        if user:
+            save_user(user)
+            target = get_user(user.id)
 
     if not target:
         await message.reply_text(
             "❌ Пользователь не найден.\n"
-            "Он должен хотя бы раз написать сообщение "
-            "в чате с ботом."
+            "Он должен хотя бы раз написать боту "
+            "в этом чате."
         )
         return
+
+    user_id = target["user_id"]
 
     name = get_display_name(target)
-    rewards = get_rewards(target["user_id"])
+
+    membership = await get_membership(
+        context,
+        chat.id,
+        user_id,
+    )
+
+    last_active = format_last_active(
+        target["last_seen"]
+    )
+
+    day, week, month, total = get_activity(
+        user_id,
+        chat.id,
+    )
+
+    # Для старой базы сохраняем старое общее
+    # количество сообщений, если новых записей
+    # активности ещё нет.
+    total = max(total, target["messages"] or 0)
+
+    rewards = get_rewards(user_id)
 
     rewards_text = (
-        "\n".join("🏅 " + item for item in rewards)
-        if rewards else "Пока нет наград"
+        "\n".join("🏅 " + reward for reward in rewards)
+        if rewards
+        else "🎗 Пока нет наград"
     )
 
-    await message.reply_text(
-        f"👤 ПРОФИЛЬ\n\n"
-        f"Имя: {name}\n"
-        f"ID: {target['user_id']}\n"
-        f"Сообщений: {target['messages']}\n\n"
-        f"🏆 НАГРАДЫ:\n{rewards_text}"
+    profile_text = (
+        f"👤 Это пользователь {name}\n"
+        f"{membership}\n\n"
+        f"Последний актив: {last_active}\n\n"
+        f"Актив (д|н|м|весь): "
+        f"{day} | {week} | {month} | {total}\n\n"
+        f"🏆 НАГРАДЫ:\n"
+        f"{rewards_text}"
     )
 
-
-# =============== НИК ===============
-
-async def nickname(update, context):
-    message = update.message
-
-    if not message:
-        return
-
-    new_nickname = " ".join(context.args).strip()
-
-    if not new_nickname:
-        await message.reply_text(
-            "Использование:\n+ник НовыйНик\n\n"
-            "Для удаления ника:\n+ник сброс"
-        )
-        return
-
-    user = update.effective_user
-
-    if len(new_nickname) > 32:
-        await message.reply_text(
-            "❌ Максимальная длина ника — 32 символа."
-        )
-        return
-
-    if any(ord(char) < 32 for char in new_nickname):
-        await message.reply_text(
-            "❌ Недопустимые символы."
-        )
-        return
-
-    save_user(user)
-
-    if new_nickname.lower() == "сброс":
-        set_nickname(user.id, "")
-
-        await message.reply_text(
-            "✅ Персональный ник удалён.\n"
-            "Теперь отображается имя Telegram."
-        )
-        return
-
-    set_nickname(user.id, new_nickname)
-
-    await message.reply_text(
-        f"✅ Ник установлен: {new_nickname}\n"
-        "Теперь он будет отображаться в профиле."
-    )
+    await message.reply_text(profile_text)
 
 
-# =============== НАГРАДЫ ===============
+# =============== СПИСОК НАГРАД ===============
 
 async def rewards_command(update, context):
     text = "🏆 СПИСОК НАГРАД\n\n"
 
     for amount, reward in REWARD_LEVELS:
-        text += f"🥇 {reward} — {amount} сообщений\n"
+        text += f"🎗 {reward} — {amount} сообщений\n"
 
     await update.message.reply_text(text)
 
@@ -372,20 +521,30 @@ async def rewards_command(update, context):
 # =============== СТАТИСТИКА ===============
 
 async def statistics(update, context):
-    with db() as conn:
-        total_users = conn.execute(
-            "SELECT COUNT(*) FROM users"
-        ).fetchone()[0]
+    chat_id = update.effective_chat.id
 
-        total_messages = conn.execute(
-            "SELECT COALESCE(SUM(messages), 0) FROM users"
-        ).fetchone()[0]
+    with db() as conn:
+        total_users = conn.execute("""
+            SELECT COUNT(DISTINCT user_id)
+            FROM activity WHERE chat_id = ?
+        """, (chat_id,)).fetchone()[0]
+
+        total_messages = conn.execute("""
+            SELECT COUNT(*) FROM activity
+            WHERE chat_id = ?
+        """, (chat_id,)).fetchone()[0]
 
         top = conn.execute("""
-            SELECT * FROM users
-            ORDER BY messages DESC
+            SELECT
+                u.*,
+                COUNT(a.id) AS chat_messages
+            FROM users u
+            JOIN activity a ON a.user_id = u.user_id
+            WHERE a.chat_id = ?
+            GROUP BY u.user_id
+            ORDER BY chat_messages DESC
             LIMIT 10
-        """).fetchall()
+        """, (chat_id,)).fetchall()
 
     text = (
         "📊 СТАТИСТИКА ЧАТА\n\n"
@@ -394,14 +553,11 @@ async def statistics(update, context):
         "🏆 ТОП-10:\n"
     )
 
-    if not top:
-        text += "Пока нет участников."
-    else:
-        for index, user in enumerate(top, 1):
-            text += (
-                f"{index}. {get_display_name(user)}"
-                f" — {user['messages']}\n"
-            )
+    for index, user in enumerate(top, 1):
+        text += (
+            f"{index}. {get_display_name(user)}"
+            f" — {user['chat_messages']}\n"
+        )
 
     await update.message.reply_text(text)
 
@@ -410,19 +566,14 @@ async def statistics(update, context):
 
 async def handle_message(update, context):
     message = update.message
-
-    if not message or not update.effective_user:
-        return
-
     user = update.effective_user
 
-    if user.is_bot:
+    if not message or not user or user.is_bot:
         return
 
     text = (message.text or "").strip()
     lower = text.lower()
 
-    # Обычные текстовые команды
     if lower == "профиль":
         await profile(update, context)
         return
@@ -442,14 +593,29 @@ async def handle_message(update, context):
 
     if lower.startswith("+ник"):
         parts = text.split(maxsplit=1)
-        context.args = parts[1].split() if len(parts) > 1 else []
-        await nickname(update, context)
+        context.args = (
+            parts[1].split()
+            if len(parts) > 1 else []
+        )
+        await nickname_command(update, context)
         return
 
-    # Подсчёт обычного сообщения
-    messages = count_message(user)
+    # Считаем сообщения в группах и супергруппах
+    if update.effective_chat.type not in (
+        "group",
+        "supergroup",
+    ):
+        return
 
-    new_rewards = update_rewards(user.id, messages)
+    messages = count_message(
+        user,
+        update.effective_chat.id,
+    )
+
+    new_rewards = update_rewards(
+        user.id,
+        messages,
+    )
 
     for reward in new_rewards:
         await message.reply_text(
@@ -462,7 +628,7 @@ async def handle_message(update, context):
 
 def upload_backup():
     if not GOOGLE_SERVICE_ACCOUNT_JSON:
-        logger.info("Google Drive не подключён.")
+        logger.info("Google Drive не настроен.")
         return
 
     if not GOOGLE_DRIVE_FOLDER_ID:
@@ -478,9 +644,14 @@ def upload_backup():
             GOOGLE_SERVICE_ACCOUNT_JSON
         )
 
-        credentials = service_account.Credentials.from_service_account_info(
-            credentials_data,
-            scopes=["https://www.googleapis.com/auth/drive"],
+        credentials = (
+            service_account.Credentials
+            .from_service_account_info(
+                credentials_data,
+                scopes=[
+                    "https://www.googleapis.com/auth/drive"
+                ],
+            )
         )
 
         service = build(
@@ -508,21 +679,19 @@ def upload_backup():
                 resumable=True,
             )
 
-            folder_id = GOOGLE_DRIVE_FOLDER_ID.replace(
-                "'", "\\'"
+            query = (
+                "name='telegram_bot_backup.db' "
+                f"and '{GOOGLE_DRIVE_FOLDER_ID}' in parents "
+                "and trashed=false"
             )
 
-            existing = service.files().list(
-                q=(
-                    "name='telegram_bot_backup.db' "
-                    f"and '{folder_id}' in parents "
-                    "and trashed=false"
-                ),
+            result = service.files().list(
+                q=query,
                 pageSize=1,
                 fields="files(id)",
             ).execute()
 
-            files = existing.get("files", [])
+            files = result.get("files", [])
 
             if files:
                 service.files().update(
@@ -539,10 +708,10 @@ def upload_backup():
                     fields="id",
                 ).execute()
 
-        logger.info("Резервная копия Google Drive обновлена.")
+        logger.info("Google Drive: резервная копия обновлена.")
 
     except Exception:
-        logger.exception("Ошибка резервного копирования.")
+        logger.exception("Ошибка Google Drive backup.")
 
 
 async def backup_loop(application):
@@ -550,7 +719,7 @@ async def backup_loop(application):
         try:
             await asyncio.to_thread(upload_backup)
         except Exception:
-            logger.exception("Ошибка фонового резервирования.")
+            logger.exception("Ошибка резервного копирования.")
 
         await asyncio.sleep(BACKUP_INTERVAL)
 
@@ -578,7 +747,7 @@ async def post_shutdown(application):
 def main():
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Не найден TELEGRAM_BOT_TOKEN или BOT_TOKEN."
+            "Не задан TELEGRAM_BOT_TOKEN или BOT_TOKEN."
         )
 
     init_db()
@@ -591,7 +760,6 @@ def main():
         .build()
     )
 
-    # Команды Telegram
     application.add_handler(
         CommandHandler("start", profile)
     )
@@ -608,10 +776,9 @@ def main():
         CommandHandler("stats", statistics)
     )
 
-    # Обычные сообщения
     application.add_handler(
         MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
+            filters.ALL & ~filters.COMMAND,
             handle_message,
         )
     )
@@ -625,4 +792,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-                                      
