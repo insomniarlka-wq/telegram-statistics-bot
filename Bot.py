@@ -1,33 +1,44 @@
-
-import logging
 import os
+import re
+import json
 import sqlite3
-from datetime import datetime, timedelta, timezone
+import logging
+import asyncio
+import tempfile
+
+from datetime import datetime, timezone
+from pathlib import Path
 
 from telegram import Update
 from telegram.ext import (
     Application,
     CommandHandler,
-    ContextTypes,
     MessageHandler,
+    ContextTypes,
     filters,
 )
-from telegram.error import TelegramError
-
 
 # ================= НАСТРОЙКИ =================
 
 BOT_TOKEN = (
     os.getenv("TELEGRAM_BOT_TOKEN")
     or os.getenv("BOT_TOKEN")
-    or os.getenv("TELEGRAM_TOKEN")
-    or os.getenv("TOKEN")
 )
 
-DB_PATH = "statistics.db"
+DB_PATH = os.getenv("DB_PATH", "bot_database.db")
+
+# Google Drive (необязательно)
+GOOGLE_SERVICE_ACCOUNT_JSON = os.getenv(
+    "GOOGLE_SERVICE_ACCOUNT_JSON"
+)
+GOOGLE_DRIVE_FOLDER_ID = os.getenv(
+    "GOOGLE_DRIVE_FOLDER_ID"
+)
+
+BACKUP_INTERVAL = 86400  # 24 часа
 
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 
@@ -36,666 +47,405 @@ logger = logging.getLogger(__name__)
 
 # ================= БАЗА ДАННЫХ =================
 
-def connect_db():
-    return sqlite3.connect(DB_PATH)
+def db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 
 def init_db():
-    with connect_db() as db:
-
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS users_v2 (
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                first_name TEXT DEFAULT '',
-                last_name TEXT DEFAULT '',
-                username TEXT DEFAULT '',
+    with db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                user_id INTEGER PRIMARY KEY,
+                username TEXT,
+                first_name TEXT,
                 nickname TEXT DEFAULT '',
                 messages INTEGER DEFAULT 0,
-                last_active TEXT DEFAULT '',
-                PRIMARY KEY (chat_id, user_id)
+                joined TEXT,
+                last_seen TEXT
             )
         """)
 
-        # Поддержка старой базы данных
-        try:
-            db.execute("""
-                ALTER TABLE users_v2
-                ADD COLUMN last_active TEXT DEFAULT ''
-            """)
-        except sqlite3.OperationalError:
-            pass
-
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS message_logs_v2 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                created_at TEXT NOT NULL
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS rewards (
+                user_id INTEGER,
+                reward TEXT,
+                PRIMARY KEY (user_id, reward)
             )
         """)
 
-        db.execute("""
-            CREATE TABLE IF NOT EXISTS awards_v2 (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                giver_id INTEGER NOT NULL,
-                award TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-        """)
 
-        db.execute("""
-            CREATE INDEX IF NOT EXISTS idx_logs_chat_date
-            ON message_logs_v2(chat_id, created_at)
-        """)
+def save_user(user):
+    now = datetime.now(timezone.utc).isoformat()
 
-
-# ================= ПОЛЬЗОВАТЕЛИ =================
-
-def save_user(chat, user):
-    with connect_db() as db:
-        db.execute("""
-            INSERT INTO users_v2 (
-                chat_id,
-                user_id,
-                first_name,
-                last_name,
-                username
+    with db() as conn:
+        conn.execute("""
+            INSERT INTO users (
+                user_id, username, first_name,
+                joined, last_seen
             )
             VALUES (?, ?, ?, ?, ?)
 
-            ON CONFLICT(chat_id, user_id)
-            DO UPDATE SET
+            ON CONFLICT(user_id) DO UPDATE SET
+                username = excluded.username,
                 first_name = excluded.first_name,
-                last_name = excluded.last_name,
-                username = excluded.username
+                last_seen = excluded.last_seen
         """, (
-            chat.id,
             user.id,
-            user.first_name or "",
-            user.last_name or "",
-            user.username or "",
+            user.username,
+            user.first_name,
+            now,
+            now,
         ))
 
 
-def add_message(chat_id, user_id):
-    now = datetime.now(timezone.utc).isoformat()
+def count_message(user):
+    save_user(user)
 
-    with connect_db() as db:
-
-        db.execute("""
-            UPDATE users_v2
-            SET messages = messages + 1,
-                last_active = ?
-            WHERE chat_id = ? AND user_id = ?
-        """, (now, chat_id, user_id))
-
-        db.execute("""
-            INSERT INTO message_logs_v2 (
-                chat_id,
-                user_id,
-                created_at
-            )
-            VALUES (?, ?, ?)
-        """, (chat_id, user_id, now))
+    with db() as conn:
+        conn.execute("""
+            UPDATE users
+            SET messages = messages + 1
+            WHERE user_id = ?
+        """, (user.id,))
 
 
-def display_name(row):
-    nickname = row[0]
-    first_name = row[1]
-    last_name = row[2]
-    username = row[3]
+def set_nickname(user_id, nickname):
+    with db() as conn:
+        cursor = conn.execute("""
+            UPDATE users
+            SET nickname = ?
+            WHERE user_id = ?
+        """, (nickname, user_id))
 
-    if nickname:
-        return nickname
+        return cursor.rowcount > 0
 
-    full_name = f"{first_name} {last_name}".strip()
 
-    return full_name or (
-        f"@{username}" if username else "Без имени"
+def get_user(user_id):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM users WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()
+
+
+def get_user_by_username(username):
+    username = username.lstrip("@").lower()
+
+    with db() as conn:
+        return conn.execute("""
+            SELECT * FROM users
+            WHERE LOWER(username) = ?
+            LIMIT 1
+        """, (username,)).fetchone()
+
+
+def get_display_name(user):
+    # СНАЧАЛА персональный ник, потом имя Telegram
+    nickname = user["nickname"]
+
+    if nickname and nickname.strip():
+        return nickname.strip()
+
+    if user["username"]:
+        return "@" + user["username"]
+
+    return user["first_name"] or "Пользователь"
+
+
+# ================= НАГРАДЫ =================
+
+REWARD_LEVELS = [
+    (100, "Активист"),
+    (500, "Постоянный участник"),
+    (1000, "Легенда чата"),
+    (5000, "Мастер общения"),
+]
+
+
+def update_rewards(user_id, messages):
+    new_rewards = []
+
+    with db() as conn:
+        for threshold, reward in REWARD_LEVELS:
+            if messages >= threshold:
+                exists = conn.execute("""
+                    SELECT 1 FROM rewards
+                    WHERE user_id = ? AND reward = ?
+                """, (user_id, reward)).fetchone()
+
+                if not exists:
+                    conn.execute("""
+                        INSERT INTO rewards (user_id, reward)
+                        VALUES (?, ?)
+                    """, (user_id, reward))
+
+                    new_rewards.append(reward)
+
+    return new_rewards
+
+
+def get_rewards(user_id):
+    with db() as conn:
+        rows = conn.execute("""
+            SELECT reward FROM rewards
+            WHERE user_id = ?
+        """, (user_id,)).fetchall()
+
+    return [row["reward"] for row in rows]
+
+
+# ================= ПРОФИЛЬ =================
+
+async def profile(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
+        return
+
+    target = None
+
+    if context.args:
+        argument = context.args[0]
+
+        if argument.startswith("@"):
+            target = get_user_by_username(argument)
+        elif argument.isdigit():
+            target = get_user(int(argument))
+
+    elif update.message.reply_to_message:
+        replied = update.message.reply_to_message.from_user
+        save_user(replied)
+        target = get_user(replied.id)
+
+    else:
+        save_user(update.effective_user)
+        target = get_user(update.effective_user.id)
+
+    if not target:
+        await update.message.reply_text(
+            "Пользователь пока не найден в базе данных."
+        )
+        return
+
+    name = get_display_name(target)
+    rewards = get_rewards(target["user_id"])
+
+    rewards_text = (
+        "\n".join("🏅 " + r for r in rewards)
+        if rewards else "Пока нет наград"
+    )
+
+    await update.message.reply_text(
+        f"👤 ПРОФИЛЬ\n\n"
+        f"Имя: {name}\n"
+        f"ID: {target['user_id']}\n"
+        f"Сообщений: {target['messages']}\n\n"
+        f"🏆 НАГРАДЫ:\n{rewards_text}"
     )
 
 
-# ================= ПРОВЕРКА АДМИНА =================
+# ================= УСТАНОВКА НИКА =================
 
-async def is_admin(update, context):
-
-    if not update.effective_chat or not update.effective_user:
-        return False
-
-    try:
-        member = await context.bot.get_chat_member(
-            update.effective_chat.id,
-            update.effective_user.id,
-        )
-
-        return member.status in (
-            "administrator",
-            "creator",
-        )
-
-    except TelegramError:
-        logger.exception("Ошибка проверки администратора")
-        return False
-
-
-# ================= ПОДСЧЁТ СООБЩЕНИЙ =================
-
-async def count_message(update, context):
-
-    if not update.effective_chat or not update.effective_user:
+async def nickname(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message:
         return
 
-    chat = update.effective_chat
+    if not context.args:
+        await update.message.reply_text(
+            "Использование:\n+ник НовыйНик"
+        )
+        return
+
+    new_nickname = " ".join(context.args).strip()
+
+    if len(new_nickname) > 32:
+        await update.message.reply_text(
+            "Ник не должен быть длиннее 32 символов."
+        )
+        return
+
+    if not re.fullmatch(r"[\w\s\-\.!?]+", new_nickname, re.UNICODE):
+        await update.message.reply_text(
+            "Ник содержит недопустимые символы."
+        )
+        return
+
+    user = update.effective_user
+    save_user(user)
+
+    set_nickname(user.id, new_nickname)
+
+    await update.message.reply_text(
+        f"✅ Твой новый ник: {new_nickname}\n"
+        f"Теперь он будет отображаться в профиле."
+    )
+
+
+# ================= СПИСОК НАГРАД =================
+
+async def rewards_command(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    text = "🏆 СПИСОК НАГРАД\n\n"
+
+    for amount, reward in REWARD_LEVELS:
+        text += f"🥇 {reward} — {amount} сообщений\n"
+
+    await update.message.reply_text(text)
+
+
+# ================= СТАТИСТИКА =================
+
+async def statistics(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    with db() as conn:
+        total_users = conn.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        total_messages = conn.execute(
+            "SELECT SUM(messages) FROM users"
+        ).fetchone()[0] or 0
+
+        top = conn.execute("""
+            SELECT * FROM users
+            ORDER BY messages DESC
+            LIMIT 10
+        """).fetchall()
+
+    text = (
+        "📊 СТАТИСТИКА ЧАТА\n\n"
+        f"👥 Участников: {total_users}\n"
+        f"💬 Сообщений: {total_messages}\n\n"
+        "🏆 ТОП-10:\n"
+    )
+
+    for i, user in enumerate(top, 1):
+        text += (
+            f"{i}. {get_display_name(user)}"
+            f" — {user['messages']}\n"
+        )
+
+    await update.message.reply_text(text)
+
+
+# ================= ОБРАБОТКА СООБЩЕНИЙ =================
+
+async def handle_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    if not update.message or not update.effective_user:
+        return
+
     user = update.effective_user
 
     if user.is_bot:
         return
 
-    save_user(chat, user)
-    add_message(chat.id, user.id)
-
-
-# ================= ПРОФИЛЬ =================
-
-async def profile(update, context):
-
-    chat = update.effective_chat
-    user = update.effective_user
-    message = update.effective_message
-
-    parts = message.text.strip().split(maxsplit=1)
-
-    if len(parts) > 1 and parts[1].startswith("@"):
-
-        username = parts[1][1:].strip().lstrip("@")
-
-        with connect_db() as db:
-            row = db.execute("""
-                SELECT
-                    nickname,
-                    first_name,
-                    last_name,
-                    username,
-                    user_id,
-                    last_active
-                FROM users_v2
-                WHERE chat_id = ?
-                AND LOWER(username) = LOWER(?)
-                LIMIT 1
-            """, (chat.id, username)).fetchone()
-
-        if not row:
-            await message.reply_text(
-                "❌ Пользователь не найден.\n"
-                "Он должен хотя бы раз написать в группе."
-            )
-            return
-
-        nickname_value = row[0]
-        first_name = row[1]
-        last_name = row[2]
-        username_value = row[3]
-        user_id = row[4]
-        last_active = row[5]
-
-    else:
-
-        save_user(chat, user)
-
-        with connect_db() as db:
-            row = db.execute("""
-                SELECT
-                    nickname,
-                    first_name,
-                    last_name,
-                    username,
-                    user_id,
-                    last_active
-                FROM users_v2
-                WHERE chat_id = ? AND user_id = ?
-            """, (chat.id, user.id)).fetchone()
-
-        nickname_value = row[0]
-        first_name = row[1]
-        last_name = row[2]
-        username_value = row[3]
-        user_id = row[4]
-        last_active = row[5]
-
-    # Имя
-    name = (
-        nickname_value
-        or f"{first_name} {last_name}".strip()
-        or "Без имени"
-    )
-
-    username_display = (
-        f"@{username_value}"
-        if username_value
-        else name
-    )
-
-    # Проверка членства
-    try:
-        member = await context.bot.get_chat_member(
-            chat.id,
-            user_id,
-        )
-
-        if member.status in ("left", "kicked"):
-            membership = "❌ Не состоит в чате"
-        else:
-            membership = "💚 Состоит в чате"
-
-    except TelegramError:
-        membership = "❔ Статус неизвестен"
-
-    # Последняя активность
-    if last_active:
-        try:
-            last_time = datetime.fromisoformat(last_active)
-
-            difference = (
-                datetime.now(timezone.utc) - last_time
-            )
-
-            seconds = max(
-                0,
-                int(difference.total_seconds())
-            )
-
-            if seconds < 60:
-                activity = "менее минуты назад"
-
-            elif seconds < 3600:
-                activity = f"{seconds // 60} мин. назад"
-
-            elif seconds < 86400:
-                activity = f"{seconds // 3600} ч. назад"
-
-            else:
-                activity = f"{seconds // 86400} дн. назад"
-
-        except (ValueError, TypeError):
-            activity = "неизвестно"
-
-    else:
-        activity = "нет данных"
-
-    # Периоды статистики
-    now = datetime.now(timezone.utc)
-
-    day_start = now.replace(
-        hour=0,
-        minute=0,
-        second=0,
-        microsecond=0,
-    )
-
-    week_start = now - timedelta(days=7)
-    month_start = now - timedelta(days=30)
-
-    # Подсчёт сообщений
-    with connect_db() as db:
-
-        def count_since(start=None):
-
-            if start:
-                result = db.execute("""
-                    SELECT COUNT(*)
-                    FROM message_logs_v2
-                    WHERE chat_id = ?
-                    AND user_id = ?
-                    AND created_at >= ?
-                """, (
-                    chat.id,
-                    user_id,
-                    start.isoformat(),
-                )).fetchone()
-
-            else:
-                result = db.execute("""
-                    SELECT COUNT(*)
-                    FROM message_logs_v2
-                    WHERE chat_id = ?
-                    AND user_id = ?
-                """, (
-                    chat.id,
-                    user_id,
-                )).fetchone()
-
-            return result[0]
-
-        day_count = count_since(day_start)
-        week_count = count_since(week_start)
-        month_count = count_since(month_start)
-        total_count = count_since()
-
-        awards = db.execute("""
-            SELECT award
-            FROM awards_v2
-            WHERE chat_id = ? AND user_id = ?
-            ORDER BY id DESC
-        """, (chat.id, user_id)).fetchall()
-
-    # Награды
-    if awards:
-        awards_text = "\n".join(
-            f"🎗 {award[0]}"
-            for award in awards
-        )
-    else:
-        awards_text = "🎗 Пока нет наград"
-
-    # Итоговый профиль
-    profile_text = (
-        f"👤 Это пользователь {username_display}\n"
-        f"{membership}\n\n"
-        f"Последний актив: {activity}\n\n"
-        f"Актив (д|н|м|весь): "
-        f"{day_count} | {week_count} | "
-        f"{month_count} | {total_count}\n\n"
-        f"🏆 НАГРАДЫ:\n"
-        f"{awards_text}"
-    )
-
-    await message.reply_text(profile_text)
-
-
-# ================= НИК =================
-
-async def nickname(update, context):
-
-    chat = update.effective_chat
-    user = update.effective_user
-    text = update.effective_message.text.strip()
-
-    parts = text.split(maxsplit=1)
-
-    if len(parts) < 2 or not parts[1].strip():
-        await update.effective_message.reply_text(
-            "Напиши: +ник Новый ник\n"
-            "Или: +ник сброс"
-        )
-        return
-
-    new_nickname = parts[1].strip()
-
-    if len(new_nickname) > 40:
-        await update.effective_message.reply_text(
-            "Ник должен быть не длиннее 40 символов."
-        )
-        return
-
-    save_user(chat, user)
-
-    with connect_db() as db:
-
-        if new_nickname.lower() == "сброс":
-
-            db.execute("""
-                UPDATE users_v2
-                SET nickname = ''
-                WHERE chat_id = ? AND user_id = ?
-            """, (chat.id, user.id))
-
-            answer = "Твой ник сброшен."
-
-        else:
-
-            db.execute("""
-                UPDATE users_v2
-                SET nickname = ?
-                WHERE chat_id = ? AND user_id = ?
-            """, (
-                new_nickname,
-                chat.id,
-                user.id,
-            ))
-
-            answer = f"Твой новый ник: {new_nickname}"
-
-    await update.effective_message.reply_text(answer)
-
-
-# ================= НАГРАДЫ =================
-
-async def show_awards(update, context):
-
-    chat = update.effective_chat
-    user = update.effective_user
-
-    with connect_db() as db:
-        rows = db.execute("""
-            SELECT award, created_at
-            FROM awards_v2
-            WHERE chat_id = ? AND user_id = ?
-            ORDER BY id DESC
-        """, (chat.id, user.id)).fetchall()
-
-    if not rows:
-        await update.effective_message.reply_text(
-            "🏆 НАГРАДЫ:\n"
-            "🎗 Пока нет наград"
-        )
-        return
-
-    result = ["🏆 Твои награды:"]
-
-    for index, (award, created_at) in enumerate(rows, 1):
-        result.append(f"{index}. 🎗 {award}")
-
-    await update.effective_message.reply_text(
-        "\n".join(result)
-    )
-
-
-async def give_award(update, context):
-
-    if not await is_admin(update, context):
-        await update.effective_message.reply_text(
-            "Выдавать награды могут только администраторы."
-        )
-        return
-
-    message = update.effective_message
-    reply = message.reply_to_message
-
-    if not reply or not reply.from_user:
-        await message.reply_text(
-            "Нужно ответить на сообщение участника командой:\n"
-            "!наградить Текст награды"
-        )
-        return
-
-    parts = message.text.split(maxsplit=1)
-
-    if len(parts) < 2 or not parts[1].strip():
-        await message.reply_text(
-            "Напиши текст награды после !наградить."
-        )
-        return
-
-    target = reply.from_user
-    chat = update.effective_chat
-    award = parts[1].strip()
-
-    save_user(chat, target)
-
-    with connect_db() as db:
-        db.execute("""
-            INSERT INTO awards_v2 (
-                chat_id,
-                user_id,
-                giver_id,
-                award,
-                created_at
-            )
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            chat.id,
-            target.id,
-            update.effective_user.id,
-            award,
-            datetime.now(timezone.utc).isoformat(),
-        ))
-
-    await message.reply_text(
-        f"🏅 {target.first_name} получил(а) награду:\n"
-        f"🎗 {award}"
-    )
-
-
-# ================= ТОП СООБЩЕНИЙ =================
-
-async def show_top(update, context, period, title):
-
-    if not await is_admin(update, context):
-        await update.effective_message.reply_text(
-            "Просматривать топ могут только администраторы."
-        )
-        return
-
-    chat_id = update.effective_chat.id
-    now = datetime.now(timezone.utc)
-
-    if period == "day":
-        start = now - timedelta(days=1)
-
-    elif period == "week":
-        start = now - timedelta(days=7)
-
-    else:
-        start = now - timedelta(days=30)
-
-    with connect_db() as db:
-        rows = db.execute("""
-            SELECT
-                u.nickname,
-                u.first_name,
-                u.last_name,
-                u.username,
-                u.user_id,
-                COUNT(m.id) AS total
-            FROM message_logs_v2 m
-            JOIN users_v2 u
-              ON u.chat_id = m.chat_id
-              AND u.user_id = m.user_id
-            WHERE m.chat_id = ?
-              AND m.created_at >= ?
-            GROUP BY u.user_id
-            ORDER BY total DESC
-            LIMIT 10
-        """, (
-            chat_id,
-            start.isoformat(),
-        )).fetchall()
-
-    if not rows:
-        await update.effective_message.reply_text(
-            f"🏆 {title}\nПока сообщений нет."
-        )
-        return
-
-    result = [f"🏆 {title}"]
-
-    for index, row in enumerate(rows, 1):
-        name = display_name(row[:4])
-        total = row[5]
-
-        result.append(
-            f"{index}. {name} — {total}"
-        )
-
-    await update.effective_message.reply_text(
-        "\n".join(result)
-    )
-
-
-# ================= ТЕКСТОВЫЕ КОМАНДЫ =================
-
-async def text_commands(update, context):
-
-    text = update.effective_message.text.strip()
-    command = text.lower()
-
-    if command == "профиль" or command.startswith("профиль @"):
-        await profile(update, context)
-
-    elif command == "награды":
-        await show_awards(update, context)
-
-    elif command.startswith("+ник"):
+    text = (update.message.text or "").strip()
+
+    # Команда установки ника
+    if text.lower().startswith("+ник"):
+        context.args = text.split()[1:]
         await nickname(update, context)
+        return
 
-    elif command.startswith("!наградить"):
-        await give_award(update, context)
+    # Считаем обычные сообщения
+    count_message(user)
 
-    elif command == "день":
-        await show_top(
-            update,
-            context,
-            "day",
-            "Топ за последние 24 часа",
-        )
+    record = get_user(user.id)
 
-    elif command == "неделя":
-        await show_top(
-            update,
-            context,
-            "week",
-            "Топ за 7 дней",
-        )
-
-    elif command == "месяц":
-        await show_top(
-            update,
-            context,
-            "month",
-            "Топ за 30 дней",
-        )
-
-
-# ================= START =================
-
-async def start(update, context):
-
-    await update.effective_message.reply_text(
-        "Привет! Я бот статистики группы.\n\n"
-        "Команды:\n\n"
-        "профиль — твой профиль\n"
-        "профиль @username — профиль участника\n"
-        "награды — твои награды\n"
-        "+ник Новый ник — установить ник\n"
-        "+ник сброс — сбросить ник\n"
-        "!наградить Текст — выдать награду ответом\n"
-        "день — топ за сутки\n"
-        "неделя — топ за неделю\n"
-        "месяц — топ за месяц"
+    new_rewards = update_rewards(
+        user.id,
+        record["messages"],
     )
 
+    for reward in new_rewards:
+        await update.message.reply_text(
+            f"🎉 Поздравляем!\n"
+            f"Получена награда: {reward}"
+        )
 
-# ================= ОШИБКИ =================
 
-async def error_handler(update, context):
+# ================= GOOGLE DRIVE =================
 
-    logger.error(
-        "Ошибка при обработке сообщения",
-        exc_info=context.error,
-    )
+def upload_backup():
+    if not GOOGLE_SERVICE_ACCOUNT_JSON:
+        logger.info("Google Drive не настроен.")
+        return
+
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        logger.warning("Не указан ID папки Google Drive.")
+        return
+
+    try:
+        from google.oauth2 import service_account
+        from googleapiclient.discovery import build
+        from googleapiclient.http import MediaFileUpload
+
+        credentials_data = json.loads(
+            GOOGLE_SERVICE_ACCOUNT_JSON
+        )
+
+        credentials = service_account.Credentials.from_service_account_info(
+            credentials_data,
+            scopes=[
+                "https://www.googleapis.com/auth/drive.file"
+            ],
+        )
+
+        service = build(
+            "drive",
+            "v3",
+            credentials=credentials,
+            cache_discovery=False,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            backup_path = Path(temp_dir) / "backup.db"
+
+            source = sqlite3.connect(DB_PATH)
+            destination = sqlite3.connect(backup_path)
+
+            source.backup(destination)
+
+            destination.close()
+            source.close()
+
+            media = MediaFileUpload(
+                str(backup_path),
+                mimetype="application/x-sqlite3",
+            )
+
+            service.files().create(
+                body={
+                    "name": "telegram_bot_backup.db",
+                    "parents": [GOOGLE_DRIVE_FOLDER_ID],
+                },
+                media_body=media,
+                fields="id",
+            ).execute()
+
+        logger.info("Резервная копия загружена.")
+
+    except Exception:
+        logger.exception("Ошибка резервного копирования.")
+
+
+async def backup_job(context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.to_thread(upload_backup)
 
 
 # ================= ЗАПУСК =================
 
 def main():
-
     if not BOT_TOKEN:
         raise RuntimeError(
-            "Не найден токен. Добавь TELEGRAM_BOT_TOKEN "
-            "в переменные окружения FadeHost."
+            "Добавь TELEGRAM_BOT_TOKEN в переменные окружения."
         )
 
     init_db()
@@ -707,36 +457,38 @@ def main():
     )
 
     application.add_handler(
-        CommandHandler("start", start)
+        CommandHandler("start", profile)
     )
 
-    group_text = (
-        filters.TEXT
-        & ~filters.COMMAND
-        & filters.ChatType.GROUPS
-    )
-
-    # Сбор статистики
     application.add_handler(
-        MessageHandler(group_text, count_message),
-        group=0,
+        CommandHandler("profile", profile)
     )
 
-    # Обработка команд
     application.add_handler(
-        MessageHandler(group_text, text_commands),
-        group=1,
+        CommandHandler("rewards", rewards_command)
     )
 
-    application.add_error_handler(error_handler)
-
-    logger.info("Бот статистики запущен!")
-
-    application.run_polling(
-        drop_pending_updates=True
+    application.add_handler(
+        CommandHandler("stats", statistics)
     )
+
+    application.add_handler(
+        MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            handle_message,
+        )
+    )
+
+    application.job_queue.run_repeating(
+        backup_job,
+        interval=BACKUP_INTERVAL,
+        first=60,
+    )
+
+    logger.info("Бот запущен!")
+
+    application.run_polling()
 
 
 if __name__ == "__main__":
     main()
-    
